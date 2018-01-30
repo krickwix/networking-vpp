@@ -73,6 +73,8 @@ from oslo_reports import guru_meditation_report as gmr
 from oslo_reports import opts as gmr_opts
 from oslo_serialization import jsonutils
 
+from neutron_lib.utils import net
+
 
 LOG = logging.getLogger(__name__)
 
@@ -824,7 +826,7 @@ class VPPForwarder(object):
             # code at the moment. This is an assumption which might need a todo
 
             if mac is None:
-                mac = c_utils.get_random_mac(
+                mac = net.get_random_mac(
                     cfg.CONF.ml2_vpp.vpp_base_mac.split(':'))
 
             LOG.debug('Creating port %s as type %s with mac %s',
