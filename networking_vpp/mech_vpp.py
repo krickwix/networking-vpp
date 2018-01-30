@@ -29,6 +29,7 @@ import time
 from networking_vpp import compat
 from networking_vpp.compat import context as n_context
 from networking_vpp.compat import directory
+from networking_vpp.compat import driver_api as api
 from networking_vpp.compat import n_const
 from networking_vpp.compat import plugin_constants
 from networking_vpp.compat import portbindings
@@ -40,7 +41,6 @@ from neutron.callbacks import events
 from neutron.callbacks import registry
 from neutron.callbacks import resources
 from neutron.db import api as neutron_db_api
-from neutron.plugins.ml2 import driver_api as api
 
 try:
     # Newton and on
@@ -759,6 +759,15 @@ class EtcdAgentCommunicator(AgentCommunicator):
                 egress_rules.append(self._neutron_rule_to_vpp_acl(r))
         return SecurityGroup(sgid, ingress_rules, egress_rules)
 
+    # Neutron supports the following IP protocols by name
+    protocols = {'tcp': 6, 'udp': 17, 'icmp': 1, 'icmpv6': 58,
+                 'ah': 51, 'dccp': 33, 'egp': 8, 'esp': 50, 'gre': 47,
+                 'igmp': 2, 'ipv6-encap': 41, 'ipv6-frag': 44,
+                 'ipv6-icmp': 58, 'ipv6-nonxt': 59, 'ipv6-opts': 60,
+                 'ipv6-route': 43, 'ospf': 89, 'pgm': 113, 'rsvp': 46,
+                 'sctp': 132, 'udplite': 136,
+                 'vrrp': 112}
+
     def _neutron_rule_to_vpp_acl(self, rule):
         """Convert a neutron rule to vpp_acl rule.
 
@@ -769,21 +778,22 @@ class EtcdAgentCommunicator(AgentCommunicator):
         - Return the SecurityGroupRule namedtuple.
         """
         is_ipv6 = 0 if rule['ethertype'] == 'IPv4' else 1
-        # Neutron uses None to represent any protocol
-        # Use 0 to represent any protocol
+
         if rule['protocol'] is None:
+            # Neutron uses None to represent any protocol
+            # We use 0 to represent any protocol
             protocol = 0
-        # VPP rules require IANA protocol numbers
-        elif rule['protocol'] in ['tcp', 'udp', 'icmp', 'icmpv6']:
-            protocol = {'tcp': 6,
-                        'udp': 17,
-                        'icmp': 1,
-                        'icmpv6': 58}[rule['protocol']]
+        elif rule['protocol'] in self.protocols:
+            # VPP rules require IANA protocol numbers
+            # Convert input accordingly.
+            protocol = self.protocols[rule['protocol']]
         else:
-            protocol = rule['protocol']
-        # If IPv6 and protocol == icmp, convert protocol to icmpv6
-        if is_ipv6 and protocol == 1:
-            protocol = 58
+            # Convert incoming string value to an integer
+            protocol = int(rule['protocol'])
+
+        if is_ipv6 and protocol == self.protocols['icmp']:
+            protocol = self.protocols['icmpv6']
+
         # Neutron represents any ip address by setting
         # both the remote_ip_prefix and remote_group_id fields to None
         # VPP uses all zeros to represent any Ipv4/IpV6 address
@@ -818,17 +828,18 @@ class EtcdAgentCommunicator(AgentCommunicator):
             # Set the required attribute in the SecurityGroupRule tuple
             # remote_group_id to None.
             remote_group_id = None
-        # Neutron uses -1 or None to represent all ports
+        # Neutron uses -1 or None or 0 to represent all ports
         # VPP uses 0-65535 for all tcp/udp ports, Use -1 to represent all
         # ranges for ICMP types and codes
-        if rule['port_range_min'] == -1 or rule['port_range_min'] is None:
-            # Valid TCP/UDP port ranges
-            if protocol in [6, 17]:
+        if rule['port_range_min'] == -1 or not rule['port_range_min']:
+            # Valid TCP/UDP port ranges for TCP(6), UDP(17) and UDPLite(136)
+            if protocol in [6, 17, 136]:
                 port_min, port_max = (0, 65535)
             # A Value of -1 represents all ICMP/ICMPv6 types & code ranges
             elif protocol in [1, 58]:
                 port_min, port_max = (-1, -1)
-            # Ignore port_min and port_max fields
+            # Ignore port_min and port_max fields as other protocols don't
+            # use them
             else:
                 port_min, port_max = (0, 0)
         else:
