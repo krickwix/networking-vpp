@@ -15,16 +15,17 @@
 #
 
 from ipaddress import ip_network
+from networking_vpp import constants as nvpp_const
 from oslo_config import cfg
 from oslo_log import log as logging
 
-from neutron.db import api as db_api
+from neutron.db import api as neutron_db_api
 from neutron.db import common_db_mixin
 from neutron.db import l3_gwmode_db
-from neutron_lib.api.definitions import provider_net as provider
-from neutron_lib import constants
 
-from neutron_lib import exceptions as n_exc
+from networking_vpp.compat import n_const as constants
+from networking_vpp.compat import n_exc
+from networking_vpp.compat import n_provider as provider
 
 # TODO(ijw): backward compatibility doesn't really belong here
 try:
@@ -38,7 +39,6 @@ try:
 except ImportError:
     from neutron.db.models.l3 import Router
 
-from networking_vpp.agent import server
 from networking_vpp.db import db
 from networking_vpp.mech_vpp import EtcdAgentCommunicator
 
@@ -68,14 +68,18 @@ class VppL3RouterPlugin(common_db_mixin.CommonDbMixin,
         super(VppL3RouterPlugin, self).__init__()
         self.communicator = EtcdAgentCommunicator(
             notify_bound=lambda *args: None)
-        self.l3_host = cfg.CONF.ml2_vpp.l3_host
+        self.l3_hosts = cfg.CONF.ml2_vpp.l3_hosts.replace(' ', '').split(',')
         self.gpe_physnet = cfg.CONF.ml2_vpp.gpe_locators
         LOG.info('vpp-router: router_service plugin has initialized')
+        if cfg.CONF.ml2_vpp.enable_l3_ha:
+            LOG.info('vpp-router: L3 HA is enabled')
+        LOG.debug('vpp-router l3_hosts: %s', self.l3_hosts)
 
-    def _floatingip_path(self, fip_id):
-        return (server.LEADIN + '/nodes/' + self.l3_host + '/' +
-                server.ROUTER_FIP_DIR + fip_id)
+    def _floatingip_path(self, l3_host, fip_id):
+        return (nvpp_const.LEADIN + '/nodes/' + l3_host + '/' +
+                nvpp_const.ROUTER_FIP_DIR + fip_id)
 
+    @neutron_db_api.context_manager.writer
     def _process_floatingip(self, context, fip_dict, event_type):
         port = self._core_plugin.get_port(context, fip_dict['port_id'])
         external_network = self._core_plugin.get_network(
@@ -107,10 +111,12 @@ class VppL3RouterPlugin(common_db_mixin.CommonDbMixin,
             LOG.debug("Router: disassociating floating ip: %s", fip_dict)
             vpp_floatingip_dict = None
 
-        db.journal_write(context.session,
-                         self._floatingip_path(fip_dict['id']),
-                         vpp_floatingip_dict)
+        for l3_host in self.l3_hosts:
+            db.journal_write(context.session,
+                             self._floatingip_path(l3_host, fip_dict['id']),
+                             vpp_floatingip_dict)
 
+    @neutron_db_api.context_manager.reader
     def _get_vpp_router(self, context, router_id):
         try:
             router = self._get_by_id(context, Router, router_id)
@@ -119,6 +125,7 @@ class VppL3RouterPlugin(common_db_mixin.CommonDbMixin,
                                    router_id)
         return router
 
+    @neutron_db_api.context_manager.reader
     def _get_router_interface(self, context, router_id, router_dict):
 
         """Populate the param: "router_dict" with values and return.
@@ -169,29 +176,32 @@ class VppL3RouterPlugin(common_db_mixin.CommonDbMixin,
         router_dict['vrf_id'] = vrf_id
         return router_dict
 
-    def _get_router_intf_path(self, router_id, port_id):
-        return (server.LEADIN + '/nodes/' +
-                self.l3_host + '/' + server.ROUTERS_DIR +
+    def _get_router_intf_path(self, l3_host, router_id, port_id):
+        return (nvpp_const.LEADIN + '/nodes/' +
+                l3_host + '/' + nvpp_const.ROUTERS_DIR +
                 router_id + '/' + port_id)
 
+    @neutron_db_api.context_manager.writer
     def _write_interface_journal(self, context, router_id, router_dict):
         LOG.info("router-service: writing router interface journal for "
                  "router_id:%s, router_dict:%s", router_id, router_dict)
-        router_intf_path = self._get_router_intf_path(
-            router_id,
-            router_dict['port_id'])
-        db.journal_write(context.session, router_intf_path, router_dict)
-        self.communicator.kick()
+        for l3_host in self.l3_hosts:
+            router_intf_path = self._get_router_intf_path(
+                l3_host, router_id, router_dict['port_id'])
+            db.journal_write(context.session, router_intf_path, router_dict)
+            self.communicator.kick()
 
+    @neutron_db_api.context_manager.writer
     def _remove_interface_journal(self, context, router_id, port_id):
         LOG.info("router-service: removing router interface journal for "
                  "router_id:%s, port_id:%s", router_id, port_id)
-        router_intf_path = self._get_router_intf_path(
-            router_id,
-            port_id)
-        db.journal_write(context.session, router_intf_path, None)
-        self.communicator.kick()
+        for l3_host in self.l3_hosts:
+            router_intf_path = self._get_router_intf_path(
+                l3_host, router_id, port_id)
+            db.journal_write(context.session, router_intf_path, None)
+            self.communicator.kick()
 
+    @neutron_db_api.context_manager.writer
     def _write_router_external_gw_journal(self, context, router_id,
                                           router_dict, delete=False):
         LOG.info("Writing router external gateway using router_dict: %s",
@@ -235,11 +245,14 @@ class VppL3RouterPlugin(common_db_mixin.CommonDbMixin,
             # This the IP address of the external gateway that functions as
             # the default gateway for the tenant's router
             router_dict['external_gateway_ip'] = subnet['gateway_ip']
-            etcd_key = self._get_router_intf_path(router_id, gateway_port)
-            if delete:
-                router_dict = None
-            db.journal_write(context.session, etcd_key, router_dict)
-            self.communicator.kick()
+            for l3_host in self.l3_hosts:
+                etcd_key = self._get_router_intf_path(l3_host, router_id,
+                                                      gateway_port)
+                if delete:
+                    db.journal_write(context.session, etcd_key, None)
+                else:
+                    db.journal_write(context.session, etcd_key, router_dict)
+                self.communicator.kick()
 
     def get_plugin_type(self):
         # TODO(ijw): not really the right place for backward compatibility...
@@ -254,10 +267,9 @@ class VppL3RouterPlugin(common_db_mixin.CommonDbMixin,
                 "using VPP.")
 
     def create_router(self, context, router):
-        session = db_api.get_session()
-        with session.begin(subtransactions=True):
-            router_dict = super(VppL3RouterPlugin, self).create_router(
-                context, router)
+        router_dict = super(VppL3RouterPlugin, self).create_router(
+            context, router)
+        with neutron_db_api.context_manager.writer.using(context):
             # Allocate VRF for this router
             db.add_router_vrf(context.session, router_dict['id'])
             if router_dict.get('external_gateway_info', False):
@@ -289,8 +301,7 @@ class VppL3RouterPlugin(common_db_mixin.CommonDbMixin,
         return new_router
 
     def delete_router(self, context, router_id):
-        session = db_api.get_session()
-        with session.begin(subtransactions=True):
+        with neutron_db_api.context_manager.writer.using(context):
             router = self.get_router(context, router_id)
             super(VppL3RouterPlugin, self).delete_router(context, router_id)
             # Delete the external gateway key from etcd
@@ -300,13 +311,11 @@ class VppL3RouterPlugin(common_db_mixin.CommonDbMixin,
             db.delete_router_vrf(context.session, router_id)
 
     def create_floatingip(self, context, floatingip):
-        session = db_api.get_session()
-        with session.begin(subtransactions=True):
-            fip_dict = super(VppL3RouterPlugin, self).create_floatingip(
-                context, floatingip,
-                initial_status=constants.FLOATINGIP_STATUS_ACTIVE)
-            if fip_dict.get('port_id') is not None:
-                self._process_floatingip(context, fip_dict, 'associate')
+        fip_dict = super(VppL3RouterPlugin, self).create_floatingip(
+            context, floatingip,
+            initial_status=constants.FLOATINGIP_STATUS_ACTIVE)
+        if fip_dict.get('port_id') is not None:
+            self._process_floatingip(context, fip_dict, 'associate')
 
         if fip_dict.get('port_id') is not None:
             self.communicator.kick()
@@ -316,28 +325,24 @@ class VppL3RouterPlugin(common_db_mixin.CommonDbMixin,
     @kick_communicator_on_end
     def update_floatingip(self, context, floatingip_id, floatingip):
         org_fip_dict = self.get_floatingip(context, floatingip_id)
-        session = db_api.get_session()
-        with session.begin(subtransactions=True):
-            fip_dict = super(VppL3RouterPlugin, self).update_floatingip(
-                context, floatingip_id, floatingip)
-            if fip_dict.get('port_id') is not None:
-                event_type = 'associate'
-                vpp_fip_dict = fip_dict
-            else:
-                event_type = 'disassociate'
-                vpp_fip_dict = org_fip_dict
-            self._process_floatingip(context, vpp_fip_dict, event_type)
+        fip_dict = super(VppL3RouterPlugin, self).update_floatingip(
+            context, floatingip_id, floatingip)
+        if fip_dict.get('port_id') is not None:
+            event_type = 'associate'
+            vpp_fip_dict = fip_dict
+        else:
+            event_type = 'disassociate'
+            vpp_fip_dict = org_fip_dict
+        self._process_floatingip(context, vpp_fip_dict, event_type)
 
         return fip_dict
 
     def delete_floatingip(self, context, floatingip_id):
         org_fip_dict = self.get_floatingip(context, floatingip_id)
-        session = db_api.get_session()
-        with session.begin(subtransactions=True):
-            super(VppL3RouterPlugin, self).delete_floatingip(
-                context, floatingip_id)
-            if org_fip_dict.get('port_id') is not None:
-                self._process_floatingip(context, org_fip_dict, 'disassociate')
+        super(VppL3RouterPlugin, self).delete_floatingip(
+            context, floatingip_id)
+        if org_fip_dict.get('port_id') is not None:
+            self._process_floatingip(context, org_fip_dict, 'disassociate')
 
         if org_fip_dict.get('port_id') is not None:
             self.communicator.kick()
@@ -346,15 +351,14 @@ class VppL3RouterPlugin(common_db_mixin.CommonDbMixin,
     def disassociate_floatingips(self, context, port_id, do_notify=True):
         fips = self.get_floatingips(context.elevated(),
                                     filters={'port_id': [port_id]})
-        session = db_api.get_session()
-        with session.begin(subtransactions=True):
-            router_ids = super(
-                VppL3RouterPlugin, self).disassociate_floatingips(
-                context, port_id, do_notify)
-            for fip in fips:
-                self._process_floatingip(context, fip, 'disassociate')
+        router_ids = super(
+            VppL3RouterPlugin, self).disassociate_floatingips(
+            context, port_id, do_notify)
+        for fip in fips:
+            self._process_floatingip(context, fip, 'disassociate')
         return router_ids
 
+    @neutron_db_api.context_manager.reader
     def _get_router_port_on_subnet(self, context, router_id, router_dict):
         filters = {'device_id': [router_id]}
         router_ports = self._core_plugin.get_ports(context,
@@ -382,50 +386,43 @@ class VppL3RouterPlugin(common_db_mixin.CommonDbMixin,
         'port_id' key.
         """
         LOG.info("router_service: interface_info: %s", interface_info)
-        session = db_api.get_session()
-        with session.begin(subtransactions=True):
-            new_router = super(VppL3RouterPlugin, self).add_router_interface(
-                context, router_id, interface_info)
-            LOG.info("Add router interface: New router is: %s",
-                     new_router)
-            # (najoy) We should use the router port's mac-address instead of
-            # a random mac-address
-            router_dict = {}
-            port_id = new_router['port_id']
-            port = self._core_plugin.get_port(context, port_id)
-            router_dict['port_id'] = port_id
-            router_dict['loopback_mac'] = port['mac_address']
-            router_dict = self._get_router_interface(context, router_id,
-                                                     router_dict
-                                                     )
-            router = self._get_vpp_router(context, router_id)
-            port_data = {'tenant_id': router.tenant_id,
-                         'network_id': router_dict['network_id'],
-                         'fixed_ips': router_dict['fixed_ips'],
-                         'device_id': router.id,
-                         'device_owner': 'vpp-router'
-                         }
+        new_router = super(VppL3RouterPlugin, self).add_router_interface(
+            context, router_id, interface_info)
+        LOG.info("Add router interface: New router is: %s",
+                 new_router)
+        router_dict = {}
+        port_id = new_router['port_id']
+        port = self._core_plugin.get_port(context, port_id)
+        router_dict['port_id'] = port_id
+        router_dict['loopback_mac'] = port['mac_address']
+        router_dict = self._get_router_interface(context, router_id,
+                                                 router_dict
+                                                 )
+        router = self._get_vpp_router(context, router_id)
+        port_data = {'tenant_id': router.tenant_id,
+                     'network_id': router_dict['network_id'],
+                     'fixed_ips': router_dict['fixed_ips'],
+                     'device_id': router.id,
+                     'device_owner': 'vpp-router'
+                     }
 
-            self._core_plugin.update_port(context, port_id,
-                                          {'port': port_data})
+        self._core_plugin.update_port(context, port_id,
+                                      {'port': port_data})
 
-            self._write_interface_journal(context, router_id, router_dict)
+        self._write_interface_journal(context, router_id, router_dict)
 
         return new_router
 
     @kick_communicator_on_end
     def remove_router_interface(self, context, router_id, interface_info):
-        session = db_api.get_session()
-        with session.begin(subtransactions=True):
-            new_router = super(
-                VppL3RouterPlugin, self).remove_router_interface(
-                context, router_id, interface_info)
-            LOG.info("Remove router interface: New router is: %s",
-                     new_router)
-            port_id = new_router['port_id']
-            self._core_plugin.delete_port(context,
-                                          port_id,
-                                          l3_port_check=False)
-            self._remove_interface_journal(context, router_id, port_id)
+        new_router = super(VppL3RouterPlugin, self).remove_router_interface(
+            context, router_id, interface_info)
+        LOG.info("Remove router interface: New router is: %s",
+                 new_router)
+        port_id = new_router['port_id']
+        self._core_plugin.delete_port(context,
+                                      port_id,
+                                      l3_port_check=False)
+        self._remove_interface_journal(context, router_id, port_id)
 
         return new_router

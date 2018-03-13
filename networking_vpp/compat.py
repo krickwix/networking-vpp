@@ -42,12 +42,18 @@ except ImportError:
     context = neutron.context
 
 try:
+   from neutron_lib.api.definitions import provider_net as n_provider
+except ImportError:
+   # Newton, at least, has this:
+   from neutron.extensions import providernet as n_provider
+
+try:
     # Mitaka+
     import neutron_lib.constants
     import neutron_lib.exceptions
 
     n_const = neutron_lib.constants
-    n_exec = neutron_lib.exceptions
+    n_exc = neutron_lib.exceptions
 
 except ImportError:
     import neutron.common.constants  # noqa: N530
@@ -72,6 +78,16 @@ except AttributeError:
                                      HEX_ELEM + '{12}'])
 
 try:
+    from neutron.callbacks import events
+    from neutron.callbacks import registry
+    from neutron.callbacks import resources
+except ImportError:
+    # Queens+
+    from neutron_lib.callbacks import events
+    from neutron_lib.callbacks import registry
+    from neutron_lib.callbacks import resources
+
+try:
     # Newton+
     import neutron_lib.db.model_base
     import neutron_lib.plugins.directory
@@ -85,6 +101,12 @@ except ImportError:
 
     directory = neutron.manager.NeutronManager
     model_base = neutron.db.model_base
+
+try:
+    # Newton
+    n_const.L3
+except AttributeError:
+    n_const.L3 = plugin_constants.L3_ROUTER_NAT
 
 # Register security group option
 def register_securitygroups_opts(cfg):

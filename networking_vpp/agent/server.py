@@ -48,6 +48,7 @@ from networking_vpp import compat
 from networking_vpp.compat import n_const
 from networking_vpp.compat import plugin_constants
 from networking_vpp import config_opts
+from networking_vpp import constants as nvpp_const
 from networking_vpp import etcdutils
 from networking_vpp.mech_vpp import SecurityGroup
 from networking_vpp.mech_vpp import SecurityGroupRule
@@ -258,7 +259,7 @@ def decode_secgroup_tag(tag):
 ######################################################################
 # GPE constants
 # A name for a GPE locator-set, which is a set of underlay interface indexes
-gpe_lset_name = 'net-vpp-gpe-lset-1'
+gpe_lset_name = nvpp_const.GPE_LSET_NAME
 
 #######################################################################
 
@@ -314,6 +315,14 @@ class VPPForwarder(object):
         self.router_interfaces = {}  # router_port_uuid: {}
         self.router_external_interfaces = {}  # router external interfaces
         self.floating_ips = {}  # floating_ip_uuid: {}
+        if cfg.CONF.ml2_vpp.enable_l3_ha:
+            # Router BVI (loopback) interface states for L3-HA
+            self.router_interface_states = {}  # {idx: state} 1 = UP, 0 = DOWN
+            # VPP Router state variable is updated by the RouterWatcher
+            # The default router state is the BACKUP.
+            # If this node should be the master it will be told soon enough,
+            # and this will prevent us from having two masters on any restart.
+            self.router_state = False  # True = Master; False = Backup
         # mac_ip acls do not support atomic replacement.
         # Here we create a mapping of sw_if_index to VPP ACL indices
         # so we can easily lookup the ACLs associated with the interface idx
@@ -420,18 +429,12 @@ class VPPForwarder(object):
                         '%(idx)d (%(physnet_name)s)',
                         {'idx': configured_physnet_interfaces[uplink_physnet],
                          'physnet_name': physnets[uplink_physnet]})
+                # This will remove ports from bridges, which means
+                # that they may be rebound back into networks later
+                # or may be deleted if no longer used.
                 self.delete_network_bridge_on_host(net_type,
                                                    sw_if_idx,
                                                    sw_if_idx)
-            if net_type == 'vlan':
-                # We only support VLAN networks here.  GPE networks
-                # can't be reconfigured like this right now. TODO(ijw)
-                self.delete_network_bridge_on_host(net_type,
-                                                   sw_if_idx,
-                                                   sw_if_idx)
-            # This will remove ports from bridges, which means
-            # that they may be rebound back into networks later
-            # or may be deleted if no longer used.
 
         for name, if_idx in physnet_ports_found.items():
             if configured_physnet_interfaces.get(name, None) != if_idx:
@@ -687,6 +690,9 @@ class VPPForwarder(object):
             self.vpp.ifdown(*if_idxes_without_uplink)
             self.vpp.delete_from_bridge(*if_idxes)
             self.vpp.delete_bridge_domain(bridge_domain_id)
+
+        # The physnet is gone so no point in keeping the vlan sub-interface
+        # TODO(onong): VxLAN
         if net_type == 'vlan':
             if uplink_if_idx is not None:
                 self.vpp.delete_vlan_subif(uplink_if_idx)
@@ -1395,8 +1401,9 @@ class VPPForwarder(object):
 
         Arguments -
         vpp_acls - a list of VppAcl(in_idx, out_idx) namedtuples to be set
-                   on the interface. An empty list '[]' deletes all acls
-                   from the interface
+                   on the interface. An empty list '[]' deletes all user
+                   defined acls from the interface and retains only the spoof
+                   ACL
         """
         # Initialize lists with anti-spoofing vpp acl indices
         spoof_acl = self.spoof_filter_on_host()
@@ -1586,7 +1593,7 @@ class VPPForwarder(object):
                     floatingip_dict['external_segmentation_id'])
 
             # Return the internal and external interface indexes.
-            return (self.vpp.get_bridge_bvi(net_br_idx), external_if_idx)
+            return (self.ensure_bridge_bvi(net_br_idx), external_if_idx)
         else:
             LOG.error('Failed to get internal network data.')
             return None, None
@@ -1617,6 +1624,21 @@ class VPPForwarder(object):
 
         return sub_if
 
+    def _get_loopback_mac(self, loopback_idx):
+        """Returns the mac address of the loopback interface."""
+        loopback_mac = self.vpp.get_ifidx_mac_address(loopback_idx)
+        LOG.debug("mac address %s of the router BVI loopback idx: %s",
+                  loopback_mac, loopback_idx)
+        return loopback_mac
+
+    def ensure_bridge_bvi(self, bridge_idx):
+        """Ensure a BVI loopback interface for the bridge."""
+        bvi_if_idx = self.vpp.get_bridge_bvi(bridge_idx)
+        if not bvi_if_idx:
+            bvi_if_idx = self.vpp.create_loopback()
+            self.vpp.set_loopback_bridge_bvi(bvi_if_idx, bridge_idx)
+        return bvi_if_idx
+
     def ensure_router_interface_on_host(self, port_id, router_data):
         """Ensure a router interface on the local host.
 
@@ -1625,6 +1647,10 @@ class VPPForwarder(object):
         For external networks, the BVI functions as an SNAT external
         interface. For updating an interface, the service plugin removes
         the old interface and then adds the new router interface.
+
+        When Layer3 HA is enabled, the router interfaces are only enabled on
+        the active VPP router. The standby router keeps the interface in
+        an admin down state.
         """
         # The interface could be either an external_gw or an internal router
         # interface on a subnet
@@ -1661,18 +1687,41 @@ class VPPForwarder(object):
         bridge_idx = net_data['bridge_domain_id']
         # Ensure a BVI (i.e. A loopback) for the bridge domain
         loopback_idx = self.vpp.get_bridge_bvi(bridge_idx)
+        # Create a loopback BVI interface
         if not loopback_idx:
-            loopback_idx = self.vpp.create_loopback(
-                router_data['loopback_mac'])
-            self.vpp.set_loopback_bridge_bvi(loopback_idx, bridge_idx)
-            self.vpp.set_interface_vrf(loopback_idx, vrf,
-                                       is_ipv6)
-            # Make a best effort to set the MTU on the interface
-            try:
-                self.vpp.set_interface_mtu(loopback_idx, router_data['mtu'])
-            except SystemExit:
-                # Log error and continue, do not exit here
-                LOG.error("Error setting MTU on router interface")
+            # Create the loopback interface, but don't bring it UP yet
+            loopback_idx = self.ensure_bridge_bvi(bridge_idx)
+        # Set the VRF for tenant BVI interfaces, if not already set
+        if vrf and not self.vpp.get_interface_vrf(loopback_idx) == vrf:
+            self.vpp.set_interface_vrf(loopback_idx, vrf, is_ipv6)
+        # Make a best effort to set the MTU on the interface
+        try:
+            self.vpp.set_interface_mtu(loopback_idx, router_data['mtu'])
+        except SystemExit:
+            # Log error and continue, do not exit here
+            LOG.error("Error setting MTU on router interface")
+        # Get the mac address for the route BVI loopback interface
+        loopback_mac = self._get_loopback_mac(loopback_idx)
+        if cfg.CONF.ml2_vpp.enable_l3_ha:
+            # Now bring up the loopback interface, if this router is the
+            # ACTIVE router. Also populate the data structure
+            # router_interface_states so the HA code can activate and
+            # deactivate the interface
+            if self.router_state:
+                LOG.debug("Router HA state is ACTIVE")
+                LOG.debug("Bringing UP the router intf idx: %s", loopback_idx)
+                self.vpp.ifup(loopback_idx)
+                self.router_interface_states[loopback_idx] = 1
+            else:
+                LOG.debug("Router HA state is BACKUP")
+                LOG.debug("Bringing DOWN the router intf idx: %s",
+                          loopback_idx)
+                self.vpp.ifdown(loopback_idx)
+                self.router_interface_states[loopback_idx] = 0
+            LOG.debug("Current router interface states: %s",
+                      self.router_interface_states)
+        else:
+            self.vpp.ifup(loopback_idx)
         # Set SNAT on the interface if SNAT is enabled
         # Get a list of all SNAT interfaces
         int_list = self.vpp.get_snat_interfaces()
@@ -1684,8 +1733,7 @@ class VPPForwarder(object):
 
         # Add VXLAN GPE mappings for vxlan type networks
         if net_type == plugin_constants.TYPE_VXLAN:
-            self.add_local_gpe_mapping(seg_id,
-                                       router_data['loopback_mac'])
+            self.add_local_gpe_mapping(seg_id, loopback_mac)
         # Set the gateway IP address on the BVI interface, if not already set
         addresses = self.vpp.get_interface_ip_addresses(loopback_idx)
         for address in addresses:
@@ -1705,7 +1753,7 @@ class VPPForwarder(object):
             'gateway_ip': gateway_ip,
             'prefixlen': prefixlen,
             'is_ipv6': is_ipv6,
-            'mac_address': router_data['loopback_mac'],
+            'mac_address': loopback_mac,
             'is_inside': is_inside,
             'external_gateway_ip': external_gateway_ip,
             'vrf_id': vrf,
@@ -1729,6 +1777,33 @@ class VPPForwarder(object):
             self.export_routes_from_tenant_vrfs(
                 ext_gw_ip=router_dict['external_gateway_ip'])
         return loopback_idx
+
+    def become_master_router(self):
+        """This node will become the master router"""
+        LOG.debug("VPP becoming the master router..")
+        LOG.debug("Current router interface states: %s",
+                  self.router_interface_states)
+        for idx in self.router_interface_states:
+            if not self.router_interface_states[idx]:
+                LOG.debug("Bringing UP the router interface: %s", idx)
+                # TODO(najoy): Bring up intf. only if not set to admin DOWN
+                self.vpp.ifup(idx)
+                self.router_interface_states[idx] = 1
+        LOG.debug("New router interface states: %s",
+                  self.router_interface_states)
+
+    def become_backup_router(self):
+        """This node will become the backup router"""
+        LOG.debug("VPP becoming the standby router..")
+        LOG.debug("Current router interface states: %s",
+                  self.router_interface_states)
+        for idx in self.router_interface_states:
+            if self.router_interface_states[idx]:
+                LOG.debug("Bringing DOWN the router interface: %s", idx)
+                self.vpp.ifdown(idx)
+                self.router_interface_states[idx] = 0
+        LOG.debug("New router interface states: %s",
+                  self.router_interface_states)
 
     def _get_ip_network(self, gateway_ip, prefixlen):
         """Returns the IP network for the gateway in CIDR form."""
@@ -1914,6 +1989,8 @@ class VPPForwarder(object):
             else:
                 # Last subnet assigned, delete the interface
                 self.vpp.delete_loopback(bvi_if_idx)
+                if cfg.CONF.ml2_vpp.enable_l3_ha:
+                    self.router_interface_states.pop(bvi_if_idx, None)
         if router['net_type'] == 'vxlan':
             LOG.debug('Removing local vxlan GPE mappings for router '
                       'interface: %s', port_id)
@@ -1924,6 +2001,56 @@ class VPPForwarder(object):
         except Exception:
             self.router_external_interfaces.pop(port_id)
 
+    def maybe_associate_floating_ips(self):
+        """Associate any pending floating IP addresses.
+
+        We may receive a request to associate a floating
+        IP address, when the router BVI interfaces are not ready yet. So,
+        we queue such requests and do the association when the router
+        interfaces are ready.
+        """
+        LOG.debug('Router: maybe associating floating IPs: %s',
+                  self.floating_ips)
+        for floatingip in self.floating_ips:
+            if not self.floating_ips[floatingip]['state']:
+                fixedip_addr = self.floating_ips[
+                    floatingip]['fixed_ip_address']
+                floatingip_addr = self.floating_ips[
+                    floatingip]['floating_ip_address']
+                loopback_idx = self.floating_ips[floatingip]['loopback_idx']
+                external_idx = self.floating_ips[floatingip]['external_idx']
+                self._associate_floatingip(floatingip, fixedip_addr,
+                                           floatingip_addr, loopback_idx,
+                                           external_idx)
+
+    def _associate_floatingip(self, floatingip, fixedip_addr,
+                              floatingip_addr, loopback_idx, external_idx):
+        """Associate the floating ip address and update state."""
+        LOG.debug("Router: associating floatingip:%s with fixedip: %s "
+                  "loopback_idx:%s, external_idx:%s", floatingip_addr,
+                  fixedip_addr, loopback_idx, external_idx)
+        snat_interfaces = self.vpp.get_snat_interfaces()
+
+        if loopback_idx and loopback_idx not in snat_interfaces:
+            self.vpp.set_snat_on_interface(loopback_idx)
+        if external_idx and external_idx not in snat_interfaces:
+            self.vpp.set_snat_on_interface(external_idx, is_inside=0)
+        tenant_vrf = self.vpp.get_interface_vrf(loopback_idx)
+        LOG.debug('Router: Tenant VRF:%s, floating IP:%s and bvi_idx:%s',
+                  tenant_vrf, floatingip_addr, loopback_idx)
+        # If needed, add the SNAT internal and external IP address mapping.
+        snat_local_ipaddresses = self.vpp.get_snat_local_ipaddresses()
+        if fixedip_addr not in snat_local_ipaddresses and tenant_vrf:
+            LOG.debug("Router: setting 1:1 SNAT %s:%s in tenant_vrf:%s",
+                      fixedip_addr, floatingip_addr, tenant_vrf)
+            self.vpp.set_snat_static_mapping(fixedip_addr, floatingip_addr,
+                                             tenant_vrf)
+            # Clear any dynamic NAT sessions for the 1:1 NAT to take effect
+            self.vpp.clear_snat_sessions(fixedip_addr)
+            self.floating_ips[floatingip]['tenant_vrf'] = tenant_vrf
+            self.floating_ips[floatingip]['state'] = True
+        LOG.debug('Router: Associated floating IPs: %s', self.floating_ips)
+
     def associate_floatingip(self, floatingip, floatingip_dict):
         """Add the VPP configuration to support One-to-One SNAT.
 
@@ -1931,28 +2058,30 @@ class VPPForwarder(object):
         floating_ip: The UUID of the floating ip address
         floatingip_dict : The floating ip data
         """
-
         LOG.debug('Router: Associating floating ip address: %s: %s',
                   floatingip, floatingip_dict)
-        # If needed, add the SNAT interfaces.
         loopback_idx, external_idx = self._get_snat_indexes(floatingip_dict)
-        snat_interfaces = self.vpp.get_snat_interfaces()
-
-        if loopback_idx and loopback_idx not in snat_interfaces:
-            self.vpp.set_snat_on_interface(loopback_idx)
-        if external_idx and external_idx not in snat_interfaces:
-            self.vpp.set_snat_on_interface(external_idx, is_inside=0)
-
-        # If needed, add the SNAT internal and external IP address mapping.
-        snat_local_ipaddresses = self.vpp.get_snat_local_ipaddresses()
-        if floatingip_dict['fixed_ip_address'] not in snat_local_ipaddresses:
-            self.vpp.set_snat_static_mapping(
-                floatingip_dict['fixed_ip_address'],
-                floatingip_dict['floating_ip_address'])
         self.floating_ips[floatingip] = {
             'fixed_ip_address': floatingip_dict['fixed_ip_address'],
-            'floating_ip_address': floatingip_dict['floating_ip_address']
+            'floating_ip_address': floatingip_dict['floating_ip_address'],
+            'loopback_idx': loopback_idx,
+            'external_idx': external_idx,
+            'state': False
             }
+        tenant_vrf = self.vpp.get_interface_vrf(loopback_idx)
+        # Associate the floating IP iff the router has established a tenant
+        # VRF i.e. a vrf_id > 0
+        if tenant_vrf:
+            LOG.debug("Router: associate_floating_ip: tenant_vrf:%s BVI:%s",
+                      tenant_vrf, loopback_idx)
+            self.floating_ips[floatingip]['tenant_vrf'] = tenant_vrf
+            self._associate_floatingip(floatingip,
+                                       floatingip_dict['fixed_ip_address'],
+                                       floatingip_dict['floating_ip_address'],
+                                       loopback_idx,
+                                       external_idx)
+        else:
+            self.floating_ips[floatingip]['tenant_vrf'] = 'undecided'
 
     def disassociate_floatingip(self, floatingip):
         """Remove the VPP configuration used by One-to-One SNAT.
@@ -1960,7 +2089,6 @@ class VPPForwarder(object):
         Arguments:-
         floating_ip: The UUID of the floating ip address to be disassociated.
         """
-
         LOG.debug('Router: Disassociating floating ip address:%s',
                   floatingip)
         # Check if we know about this floating ip address
@@ -1973,6 +2101,7 @@ class VPPForwarder(object):
                 self.vpp.set_snat_static_mapping(
                     floatingip_dict['fixed_ip_address'],
                     floatingip_dict['floating_ip_address'],
+                    floatingip_dict['tenant_vrf'],
                     is_add=0)
             self.floating_ips.pop(floatingip)
         else:
@@ -2291,9 +2420,7 @@ class VPPForwarder(object):
 
 ######################################################################
 
-LEADIN = '/networking-vpp'  # TODO(ijw): make configurable?
-ROUTERS_DIR = 'routers/'
-ROUTER_FIP_DIR = 'routers/floatingip/'
+LEADIN = nvpp_const.LEADIN  # TODO(ijw): make configurable?
 
 
 class EtcdListener(object):
@@ -2478,10 +2605,12 @@ class EtcdListener(object):
         is_secured_port = props['bind_type'] == 'vhostuser'
 
         # If security-groups are enabled and it's a port needing
-        # security proceed to set L3/L2 ACLs, else skip security
+        # security proceed to set L3/L2 ACLs, else skip security.
+        # If security-groups are empty, apply the default spoof-acls.
+        # This is the correct behavior when security-groups are enabled but
+        # not set on a port.
         if (self.secgroup_enabled and
-                is_secured_port and
-                secgroup_ids != []):
+                is_secured_port):
             if not self.vppf.maybe_set_acls_on_port(
                     secgroup_ids,
                     iface_idx):
@@ -2822,19 +2951,6 @@ class EtcdListener(object):
         self.binder = BindNotifier(self.client_factory, self.state_key_space)
         self.pool.spawn(self.binder.run)
 
-        # Check if the vpp router service plugin is enabled
-        enable_router_watcher = False
-        for service_plugin in cfg.CONF.service_plugins:
-            if 'vpp' in service_plugin:
-                enable_router_watcher = True
-        if enable_router_watcher:
-            LOG.debug("Spawning router_watcher")
-            self.pool.spawn(RouterWatcher(self.client_factory.client(),
-                                          'router_watcher',
-                                          self.router_key_space,
-                                          heartbeat=self.AGENT_HEARTBEAT,
-                                          data=self).watch_forever)
-
         if self.secgroup_enabled:
             LOG.debug("loading VppAcl map from acl tags for "
                       "performing secgroup_watcher lookups")
@@ -2865,6 +2981,7 @@ class EtcdListener(object):
                                     self.port_key_space,
                                     heartbeat=self.AGENT_HEARTBEAT,
                                     data=self).watch_forever)
+
         # Spawn GPE watcher for vxlan tenant networks
         if 'vxlan' in cfg.CONF.ml2.type_drivers:
             LOG.debug("Spawning gpe_watcher")
@@ -2873,6 +2990,23 @@ class EtcdListener(object):
                                        self.gpe_key_space,
                                        heartbeat=self.AGENT_HEARTBEAT,
                                        data=self).watch_forever)
+
+        # Check if the vpp router service plugin is enabled
+        enable_router_watcher = False
+        for service_plugin in cfg.CONF.service_plugins:
+            if 'vpp' in service_plugin:
+                enable_router_watcher = True
+        # Spawning after the vlan/vxlan bindings are done so that
+        # the RouterWatcher doesn't do unnecessary work
+        if enable_router_watcher:
+            if cfg.CONF.ml2_vpp.enable_l3_ha:
+                LOG.info("L3 HA is enabled")
+            LOG.debug("Spawning router_watcher")
+            self.pool.spawn(RouterWatcher(self.client_factory.client(),
+                                          'router_watcher',
+                                          self.router_key_space,
+                                          heartbeat=self.AGENT_HEARTBEAT,
+                                          data=self).watch_forever)
         self.pool.waitall()
 
 
@@ -3009,8 +3143,10 @@ class RouterWatcher(etcdutils.EtcdChangeWatcher):
         The returned tuple is denoted by (token1, token2).
         If token1 == "floatingip", then token2 is the ID of the
         floatingip that is added or removed on the server.
-        Else, token1 == router_ID and token2 == port_ID of the router
+        If, token1 == router_ID and token2 == port_ID of the router
         interface that is added or removed.
+        If, token1 == 'ha', then we return that token for router watcher
+        to action.
         """
         m = re.match('([^/]+)' + '/([^/]+)', router_key)
         floating_ip, router_id, port_id = None, None, None
@@ -3025,6 +3161,23 @@ class RouterWatcher(etcdutils.EtcdChangeWatcher):
         else:
             return (None, None)
 
+    def add_remove_gpe_mappings(self, port_id, router_data, is_add=1):
+        """Add a GPE mapping to the router's loopback mac-address."""
+        if router_data.get('external_gateway_info', False):
+            loopback_mac = self.data.vppf.router_external_interfaces[
+                port_id]['mac_address']
+        else:
+            loopback_mac = self.data.vppf.router_interfaces[
+                port_id]['mac_address']
+        if is_add:
+            self.data.add_gpe_remote_mapping(router_data['segmentation_id'],
+                                             loopback_mac,
+                                             router_data['gateway_ip'])
+        else:
+            self.data.delete_gpe_remote_mapping(router_data['segmentation_id'],
+                                                loopback_mac,
+                                                router_data['gateway_ip'])
+
     def added(self, router_key, value):
         token1, token2 = self.parse_key(router_key)
         if token1 and token2:
@@ -3033,16 +3186,27 @@ class RouterWatcher(etcdutils.EtcdChangeWatcher):
                 router_data = jsonutils.loads(value)
                 self.data.vppf.ensure_router_interface_on_host(
                     port_id, router_data)
+                self.data.vppf.maybe_associate_floating_ips()
                 if router_data.get('net_type') == 'vxlan':
-                    self.data.add_gpe_remote_mapping(
-                        router_data['segmentation_id'],
-                        router_data['loopback_mac'],
-                        router_data['gateway_ip'])
+                    self.add_remove_gpe_mappings(port_id, router_data,
+                                                 is_add=1)
             else:
                 floating_ip = token2
                 floatingip_dict = jsonutils.loads(value)
                 self.data.vppf.associate_floatingip(floating_ip,
                                                     floatingip_dict)
+        if cfg.CONF.ml2_vpp.enable_l3_ha and router_key == 'ha':
+            LOG.debug('Setting VPP-Router HA State..')
+            router_state = bool(jsonutils.loads(value))
+            LOG.debug('Router state is: %s', router_state)
+            # Become master if a state is True, else become backup
+            state = 'MASTER' if router_state else 'BACKUP'
+            LOG.debug('VPP Router HA state has become: %s', state)
+            self.data.vppf.router_state = router_state
+            if router_state:
+                self.data.vppf.become_master_router()
+            else:
+                self.data.vppf.become_backup_router()
 
     def removed(self, router_key):
         token1, token2 = self.parse_key(router_key)
@@ -3052,10 +3216,8 @@ class RouterWatcher(etcdutils.EtcdChangeWatcher):
                 router_data = self.data.vppf.router_interfaces.get(port_id)
                 self.data.vppf.delete_router_interface_on_host(port_id)
                 if router_data and router_data.get('net_type') == 'vxlan':
-                    self.data.delete_gpe_remote_mapping(
-                        router_data['segmentation_id'],
-                        router_data['mac_address'],
-                        router_data['gateway_ip'])
+                    self.add_remove_gpe_mappings(port_id, router_data,
+                                                 is_add=0)
             else:
                 floating_ip = token2
                 self.data.vppf.disassociate_floatingip(floating_ip)

@@ -34,13 +34,14 @@ from networking_vpp.compat import n_const
 from networking_vpp.compat import plugin_constants
 from networking_vpp.compat import portbindings
 from networking_vpp import config_opts
+from networking_vpp import constants as nvpp_const
 from networking_vpp.db import db
 from networking_vpp import etcdutils
 
-from neutron.callbacks import events
-from neutron.callbacks import registry
-from neutron.callbacks import resources
-from neutron.db import api as neutron_db_api
+from networking_vpp.compat import events
+from networking_vpp.compat import registry
+from networking_vpp.compat import resources
+
 
 try:
     # Newton and on
@@ -388,7 +389,7 @@ class AgentCommunicator(object):
 
 
 # Our prefix for etcd keys, in case others are using etcd.
-LEADIN = '/networking-vpp'      # TODO(ijw): make configurable?
+LEADIN = nvpp_const.LEADIN   # TODO(ijw): make configurable?
 # Model for representing a security group
 SecurityGroup = namedtuple(
     'SecurityGroup', ['id', 'ingress_rules', 'egress_rules']
@@ -1062,7 +1063,7 @@ class EtcdAgentCommunicator(AgentCommunicator):
                 while True:
                     etcd_election.extend_election(
                         cfg.CONF.ml2_vpp.db_query_time)
-                    session = neutron_db_api.get_session()
+                    session = n_context.get_admin_context().session
                     maybe_more = db.journal_read(session, work)
                     if not maybe_more:
                         LOG.debug('forward worker has emptied journal')
@@ -1090,6 +1091,7 @@ class EtcdAgentCommunicator(AgentCommunicator):
                 # TODO(ijw): log exception properly
                 LOG.warning("problems in forward worker - Error name is %s. "
                             "proceeding without quiting", type(e).__name__)
+                LOG.warning("Exception in forward_worker: %s", e)
                 # something went bad; breathe, in case we end
                 # up in a tight loop
                 time.sleep(1)

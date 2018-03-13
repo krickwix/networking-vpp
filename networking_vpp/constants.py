@@ -1,5 +1,5 @@
 # Copyright (c) 2016 Cisco Systems, Inc.
-# All Rights Reserved
+# All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,19 +13,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from networking_vpp._i18n import _
-from networking_vpp.compat import n_exc
+# Common constants used by mech_vpp, server and plugins
 
-
-class InvalidEtcdCAConfig(n_exc.NeutronException):
-    message = _("Invalid etcd CA config.")
-
-
-class InvalidEtcHostsConfig(n_exc.NeutronException):
-    message = _("Invalid etc host config. Expect comma-separated list of "
-                "<Host> or <Host:Port> format")
-
-
-class InvalidEtcHostConfig(n_exc.NeutronException):
-    message = _("Invalid etc host config. Expect an IP or host name in "
-                "the form <Host> or <Host:Port>")
+LEADIN = '/networking-vpp'
+ROUTERS_DIR = 'routers/'
+ROUTER_FIP_DIR = 'routers/floatingip/'
+GPE_LSET_NAME = 'net-vpp-gpe-lset-1'
